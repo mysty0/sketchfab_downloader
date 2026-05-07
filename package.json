@@ -1,16 +1,18 @@
 {
-  "name": "sketchfab_downloader",
+  "name": "sketchfab-downloader",
   "version": "1.0.0",
-  "main": "index.js",
+  "description": "Download Sketchfab models as glTF: decrypt .binz, decode osgjs, descramble textures",
+  "main": "download.js",
+  "bin": { "sketchfab-dl": "download.js" },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "download": "node download.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "description": "",
+  "keywords": ["sketchfab", "gltf", "3d", "osgjs", "binz"],
+  "license": "MIT",
   "dependencies": {
-    "deobfuscator": "^2.4.5",
+    "sharp": "^0.34.0"
+  },
+  "devDependencies": {
     "gltf-validator": "^2.0.0-dev.3.10",
     "javascript-deobfuscator": "^1.0.3",
     "webcrack": "^2.15.1"
