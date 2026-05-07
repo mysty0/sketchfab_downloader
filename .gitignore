@@ -1,0 +1,13 @@
+node_modules/
+__pycache__/
+
+# Downloaded model data (large, per-model)
+model/
+textures/
+
+# Cached viewer JS bundles and deobfuscated output
+viewer_js/
+deobfuscated/
+
+# NPM lock
+package-lock.json
