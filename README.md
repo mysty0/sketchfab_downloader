@@ -85,7 +85,7 @@ Full reverse engineering writeup in [`docs/sketchfab-binz-format.md`](docs/sketc
 
 ## Notes
 
-- The `deobfuscated/decrypt.wasm` file (extracted from Sketchfab's viewer) is required for decryption. It's not included in this repo — extract it using the process documented in the docs.
+- `decrypt.wasm` is automatically extracted from Sketchfab's viewer JS bundles on first run. No manual setup needed.
 - Texture descrambling requires `sharp`. Without it, the script falls back to using scrambled textures and prints a warning.
 - Cached downloads are stored in `.cache/` and reused on subsequent runs for the same model.
 

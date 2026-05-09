@@ -13,5 +13,8 @@ deobfuscated/
 # NPM lock
 package-lock.json
 
+# Extracted WASM (auto-downloaded at runtime)
+decrypt.wasm
+
 # Output GLB files
 *.glb

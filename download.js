@@ -81,7 +81,7 @@ async function getModelConfig(uid) {
     }
 
     return {
-        uid, baseUrl,
+        uid, baseUrl, html,
         diterB: pMatch[2],
         diterV: parseInt(pMatch[1]),
         textureMap
@@ -120,6 +120,67 @@ async function downloadFiles(config) {
     }
 }
 
+// ─── Step 2.5: Extract decrypt.wasm from viewer JS ───────────────────────────
+
+const WASM_PATH = path.join(__dirname, 'decrypt.wasm');
+
+async function ensureWasm(embedHtml) {
+    if (fs.existsSync(WASM_PATH)) return;
+
+    console.log(`[*] Extracting decrypt.wasm from viewer bundles...`);
+
+    // Find all JS bundle URLs from embed page
+    const bundleUrls = [...new Set(
+        (embedHtml.match(/https:\/\/static\.sketchfab\.com\/static\/builds\/web\/dist\/[^"&]+\.js/g) || [])
+    )];
+
+    if (!bundleUrls.length) throw new Error('No viewer JS bundles found in embed page');
+
+    // Search each bundle for the WASM base64 (starts with AGFzbQ = \x00asm)
+    for (const url of bundleUrls) {
+        const js = (await fetch(url)).toString('utf8');
+        const wasmIdx = js.indexOf('AGFzbQ');
+        if (wasmIdx === -1) continue;
+
+        // Find the enclosing quotes
+        let start = js.lastIndexOf('"', wasmIdx) + 1;
+        let end = wasmIdx;
+        while (end < js.length) {
+            if (js[end] === '"' && js[end - 1] !== '\\') break;
+            end++;
+        }
+
+        const b64 = js.substring(start, end).replace(/\\n/g, '');
+        const wasmBytes = Buffer.from(b64, 'base64');
+
+        if (wasmBytes[0] === 0x00 && wasmBytes[1] === 0x61 && wasmBytes[2] === 0x73 && wasmBytes[3] === 0x6d) {
+            fs.writeFileSync(WASM_PATH, wasmBytes);
+            console.log(`  decrypt.wasm: ${wasmBytes.length} bytes (from ${url.split('/').pop()})`);
+            return;
+        }
+    }
+
+    throw new Error('Could not find WASM decryption module in viewer bundles');
+}
+
+// ─── Step 2.6: Extract static key from viewer JS ─────────────────────────────
+
+async function extractStaticKey(embedHtml) {
+    const bundleUrls = [...new Set(
+        (embedHtml.match(/https:\/\/static\.sketchfab\.com\/static\/builds\/web\/dist\/[^"&]+\.js/g) || [])
+    )];
+
+    for (const url of bundleUrls) {
+        const js = (await fetch(url)).toString('utf8');
+        const match = js.match(/exports\s*\.\s*k\s*:\s*\(\)\s*=>\s*\w+\}\s*;\s*const\s+\w+\s*=\s*"([0-9a-f]{40})\\n"/);
+        if (match) return match[1];
+        const match2 = js.match(/\{k:\s*\(\)\s*=>\s*\w+\}[^;]*;\s*const\s+\w+\s*=\s*"([0-9a-f]{40})/);
+        if (match2) return match2[1];
+    }
+
+    return STATIC_KEY; // fallback to hardcoded
+}
+
 // ─── Step 3: WASM decryption ──────────────────────────────────────────────────
 
 function parseWasmDataSize(wasmBytes) {
@@ -137,8 +198,8 @@ function parseWasmDataSize(wasmBytes) {
 }
 
 async function initWasm() {
-    const wasmPath = path.join(__dirname, 'deobfuscated', 'decrypt.wasm');
-    if (!fs.existsSync(wasmPath)) throw new Error('decrypt.wasm not found in deobfuscated/');
+    const wasmPath = WASM_PATH;
+    if (!fs.existsSync(wasmPath)) throw new Error('decrypt.wasm not found — run ensureWasm first');
     const wasmBytes = fs.readFileSync(wasmPath);
     const r = new Uint8Array(wasmBytes);
     const m = parseWasmDataSize(r);
@@ -722,6 +783,8 @@ async function main() {
     const config = await getModelConfig(uid);
     console.log(`  Base URL: ${config.baseUrl}`);
     console.log(`  Textures: ${Object.keys(config.textureMap).join(', ') || 'none'}\n`);
+
+    await ensureWasm(config.html);
 
     await downloadFiles(config);
     await decryptAll(config);
