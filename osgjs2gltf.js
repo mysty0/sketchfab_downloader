@@ -114,6 +114,13 @@ function expectedRenumber(arr, state) {
     return arr;
 }
 
+// Index buffers narrower than 32-bit must be widened before delta/watermark
+// decode, otherwise the arithmetic wraps (e.g. a Uint8 index buffer).
+function widenIndices(arr) {
+    if (arr instanceof Uint32Array || arr instanceof Int32Array) return arr;
+    return Int32Array.from(arr);
+}
+
 function triStripToTriangles(indices) {
     if (indices.length < 3) return new Uint32Array(0);
     const tris = [];
@@ -125,6 +132,17 @@ function triStripToTriangles(indices) {
         } else {
             tris.push(b, a, c); // flip winding on odd
         }
+    }
+    return new Uint32Array(tris);
+}
+
+// Loose triangle list (already in triangle order): drop degenerate triangles
+function looseTrianglesToTriangles(indices) {
+    const tris = [];
+    for (let i = 0; i + 2 < indices.length; i += 3) {
+        const a = indices[i], b = indices[i + 1], c = indices[i + 2];
+        if (a === b || b === c || a === c) continue; // degenerate
+        tris.push(a, b, c);
     }
     return new Uint32Array(tris);
 }
@@ -197,11 +215,21 @@ function processGeometry(geom, polyBin, wireBin, sharedState) {
 
     // Process primitives
     const primList = geom.PrimitiveSetList || [];
+    const DELTA = 1, EXPECTED = 2, IMPLICIT = 4, TRIANGLE_ATTR = 16;
+    const triMode = meta.triangle_mode || 0;
+    const hasTriAttr = (meta.attributes || 0) & TRIANGLE_ATTR;
+    const triChunks = [];
+    // The "expected"/high-watermark counter is shared across all of a geometry's
+    // primitives and processed in list order: the strip advances it, then the
+    // loose-triangle set continues from the same value. A fresh counter per
+    // primitive corrupts the loose-triangle indices.
+    const expState = [0];
     for (const prim of primList) {
         const drawType = Object.keys(prim)[0];
         const draw = prim[drawType];
         const idxInfo = draw.Indices;
         if (!idxInfo) continue;
+        if (draw.Mode !== 'TRIANGLE_STRIP' && draw.Mode !== 'TRIANGLES') continue;
 
         const arrInfo = idxInfo.Array;
         const arrType = Object.keys(arrInfo)[0];
@@ -210,37 +238,40 @@ function processGeometry(geom, polyBin, wireBin, sharedState) {
         const binSrc = isWireframe ? wireBin : polyBin;
         if (!binSrc) continue;
 
-        let indices = readBufferArray(binSrc.buffer, { ...arrDef, ItemSize: 1 }, arrType);
         const isStrip = draw.Mode === 'TRIANGLE_STRIP';
+        let indices = widenIndices(readBufferArray(binSrc.buffer, { ...arrDef, ItemSize: 1 }, arrType));
 
-        // Decode triangle mode
-        const triMode = meta.triangle_mode || 0;
-        const DELTA = 1, EXPECTED = 2, IMPLICIT = 4;
-        let startIdx = 0;
+        if (!hasTriAttr) {
+            // Indices stored directly (not delta/watermark encoded).
+            if (isStrip) { result.stripIndices = indices; triChunks.push(triStripToTriangles(indices)); }
+            else triChunks.push(looseTrianglesToTriangles(indices));
+            continue;
+        }
 
+        let out = indices, startIdx = 0;
         if ((triMode & IMPLICIT) && isStrip) {
             startIdx = 3 + indices[1]; // IMPLICIT_HEADER_LENGTH + mask_length
-            const outLen = indices[0];
-            const decoded = new Uint16Array(outLen);
-            if (triMode & DELTA) deltaDecodeInPlace(indices, startIdx);
-            implicitDecode(indices, decoded, startIdx, !!(triMode & EXPECTED));
-            indices = decoded;
-        } else {
-            if (triMode & DELTA) deltaDecodeInPlace(indices, 0);
+            out = new Int32Array(indices[0]);
         }
-
-        if (triMode & EXPECTED) {
-            expectedRenumber(indices, [0]);
-        }
-
-        // Keep strip indices for parallelogram prediction before converting
-        result.stripIndices = isStrip ? indices : null;
+        if (triMode & DELTA) deltaDecodeInPlace(indices, startIdx);
+        if ((triMode & IMPLICIT) && isStrip) implicitDecode(indices, out, startIdx, !!(triMode & EXPECTED));
+        if (triMode & EXPECTED) expectedRenumber(out, expState);
 
         if (isStrip) {
-            indices = triStripToTriangles(indices);
+            result.stripIndices = out; // kept for parallelogram vertex prediction
+            triChunks.push(triStripToTriangles(out));
+        } else {
+            triChunks.push(looseTrianglesToTriangles(out));
         }
+    }
 
-        result.indices = indices;
+    let total = 0;
+    for (const c of triChunks) total += c.length;
+    if (total) {
+        const merged = new Uint32Array(total);
+        let o = 0;
+        for (const c of triChunks) { merged.set(c, o); o += c.length; }
+        result.indices = merged;
         result.mode = 'TRIANGLES';
     }
 

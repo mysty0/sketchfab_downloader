@@ -518,10 +518,18 @@ function implicitDecode(enc, output, startIdx, useExpected) {
     return output;
 }
 
-function expectedRenumber(arr) {
-    let n = 0;
+function expectedRenumber(arr, state) {
+    let n = state[0];
     for (let a = 0; a < arr.length; a++) { const o = n - arr[a]; arr[a] = o; if (n <= o) n = o + 1; }
+    state[0] = n;
     return arr;
+}
+
+// Index buffers narrower than 32-bit must be widened before delta/watermark
+// decode, otherwise the arithmetic wraps around (e.g. a Uint8 index buffer).
+function widenIndices(arr) {
+    if (arr instanceof Uint32Array || arr instanceof Int32Array) return arr;
+    return Int32Array.from(arr);
 }
 
 function parallelogramPredict(data, itemSize, strip) {
@@ -543,6 +551,16 @@ function stripToTris(indices) {
         const a = indices[i], b = indices[i + 1], c = indices[i + 2];
         if (a === b || b === c || a === c) continue;
         if (i % 2 === 0) tris.push(a, b, c); else tris.push(b, a, c);
+    }
+    return new Uint32Array(tris);
+}
+
+function looseToTris(indices) {
+    const tris = [];
+    for (let i = 0; i + 2 < indices.length; i += 3) {
+        const a = indices[i], b = indices[i + 1], c = indices[i + 2];
+        if (a === b || b === c || a === c) continue;
+        tris.push(a, b, c);
     }
     return new Uint32Array(tris);
 }
@@ -585,27 +603,48 @@ function convertToGltf(osgjs, polyBin, wireBin, textureFiles) {
         if (geom.UserDataContainer && geom.UserDataContainer.Values)
             for (const v of geom.UserDataContainer.Values) meta[v.Name] = isNaN(Number(v.Value)) ? v.Value : Number(v.Value);
 
-        let stripIndices = null, indices = null;
+        let stripIndices = null;
+        const triChunks = [];
+        // The "expected"/high-watermark counter is shared across all of a
+        // geometry's primitives and processed in list order: the strip advances
+        // it, then the loose-triangle set continues from the same value. Using a
+        // fresh counter per primitive corrupts the loose-triangle indices.
+        const expState = [0];
+        const tm = meta.triangle_mode || 0;
+        const hasTriAttr = (meta.attributes || 0) & 16;
         for (const prim of (geom.PrimitiveSetList || [])) {
             const dt = Object.keys(prim)[0], draw = prim[dt];
             if (!draw.Indices) continue;
+            if (draw.Mode !== 'TRIANGLE_STRIP' && draw.Mode !== 'TRIANGLES') continue;
             const ai = draw.Indices.Array, at = Object.keys(ai)[0], ad = ai[at];
             const bin = ad.File && ad.File.includes('wireframe') ? wireBin : polyBin;
             if (!bin) continue;
-            let idx = readBuf(bin.buffer, { ...ad, ItemSize: 1 }, 1, at);
             const isStrip = draw.Mode === 'TRIANGLE_STRIP';
-            const tm = meta.triangle_mode || 0;
+            let idx = widenIndices(readBuf(bin.buffer, { ...ad, ItemSize: 1 }, 1, at));
+
+            if (!hasTriAttr) {
+                // Indices stored directly (not delta/watermark encoded).
+                if (isStrip) { stripIndices = idx; triChunks.push(stripToTris(idx)); }
+                else triChunks.push(looseToTris(idx));
+                continue;
+            }
+
+            let out = idx, start = 0;
             if ((tm & 4) && isStrip) {
-                const startIdx = 3 + idx[1], outLen = idx[0], decoded = new Uint16Array(outLen);
-                if (tm & 1) deltaDecode(idx, startIdx);
-                implicitDecode(idx, decoded, startIdx, !!(tm & 2));
-                idx = decoded;
-            } else if (tm & 1) deltaDecode(idx, 0);
-            if (tm & 2) expectedRenumber(idx);
-            stripIndices = isStrip ? idx : null;
-            indices = isStrip ? stripToTris(idx) : idx;
+                start = 3 + idx[1];
+                out = new Int32Array(idx[0]);
+            }
+            if (tm & 1) deltaDecode(idx, start);
+            if ((tm & 4) && isStrip) implicitDecode(idx, out, start, !!(tm & 2));
+            if (tm & 2) expectedRenumber(out, expState);
+
+            if (isStrip) { stripIndices = out; triChunks.push(stripToTris(out)); }
+            else triChunks.push(looseToTris(out));
         }
-        if (!indices) return null;
+        let total = 0; for (const c of triChunks) total += c.length;
+        if (!total) return null;
+        const indices = new Uint32Array(total);
+        { let o = 0; for (const c of triChunks) { indices.set(c, o); o += c.length; } }
 
         const attrs = {};
         const vaList = geom.VertexAttributeList || {};
