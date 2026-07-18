@@ -15,6 +15,7 @@ package-lock.json
 
 # Extracted WASM (auto-downloaded at runtime)
 decrypt.wasm
+.wasm_backups/
 
 # Output GLB files
 *.glb

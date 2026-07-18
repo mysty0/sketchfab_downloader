@@ -222,7 +222,7 @@ async function initWasm() {
     return { a: ex, H: () => { refresh(); return u8; }, memory };
 }
 
-async function decryptBinz(binzPath, diterB) {
+async function decryptBinz(binzPath, diterB, staticKey) {
     const encData = fs.readFileSync(binzPath);
     const wasm = await initWasm();
     const a = wasm.a;
@@ -237,7 +237,7 @@ async function decryptBinz(binzPath, diterB) {
     const getStart = a['TmV2ZXIgZ29ubmEgZ2l2ZSB5b3UgdXAKT'];
 
     // Key setup
-    const keyHex = STATIC_KEY.slice(0, 40).toLowerCase();
+    const keyHex = (staticKey || STATIC_KEY).slice(0, 40).toLowerCase();
     const seed = 1314 + Math.floor(9999 * Math.random());
     const collected = [];
     let running = seed;
@@ -294,7 +294,7 @@ async function decryptAll(config) {
         const src = path.join(WORK_DIR, names[i]);
         const dst = path.join(WORK_DIR, outputs[i]);
         if (fs.existsSync(dst)) continue;
-        const result = await decryptBinz(src, config.diterB);
+        const result = await decryptBinz(src, config.diterB, config.staticKey);
         fs.writeFileSync(dst, result);
         console.log(`  ${outputs[i]}: ${result.length} bytes`);
     }
@@ -785,6 +785,7 @@ async function main() {
     console.log(`  Textures: ${Object.keys(config.textureMap).join(', ') || 'none'}\n`);
 
     await ensureWasm(config.html);
+    config.staticKey = await extractStaticKey(config.html);
 
     await downloadFiles(config);
     await decryptAll(config);
