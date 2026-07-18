@@ -69,18 +69,21 @@ async function getModelConfig(uid) {
     // Parse each material separately. A model can have several materials (e.g. an
     // asteroid pack with one atlas per rock); applying one material's textures to
     // every geometry makes the others' UVs land in the atlas's empty regions.
-    // Each material is "name": "..._MAT", "channels": {...}. Pair every channels
-    // block with the material name just before it, then read its enabled channels
+    // Each material is "name": "...", "version": N, "channels": {...}. Pair every
+    // channels block with the material name just before it (works whether names
+    // are like "Asteroid_1_MAT" or "KOBRA_PAINT"), then read its enabled channels
     // (bounding each channel to the next so a disabled one can't grab the next's
-    // texture).
+    // texture). Also index materials by their albedo texture-set uid, which is how
+    // each geometry's StateSet references its material.
     const CHANNELS = ['AlbedoPBR', 'EmitColor', 'NormalMap', 'MetalnessPBR', 'RoughnessPBR'];
     const materials = {};
+    const materialsByAlbedo = {};
     const chanStarts = [...html.matchAll(/"channels"\s*:\s*\{/g)].map(m => m.index);
-    const matNames = [...html.matchAll(/"name"\s*:\s*"([^"]*_MAT[^"]*)"/g)].map(m => ({ name: m[1], idx: m.index }));
+    const allNames = [...html.matchAll(/"name"\s*:\s*"([^"]+)"/g)].map(m => ({ name: m[1], idx: m.index }));
     for (let bi = 0; bi < chanStarts.length; bi++) {
         const cs = chanStarts[bi];
         let mat = null;
-        for (const mnp of matNames) if (mnp.idx < cs && (!mat || mnp.idx > mat.idx)) mat = mnp;
+        for (const mnp of allNames) if (mnp.idx < cs && (!mat || mnp.idx > mat.idx)) mat = mnp;
         if (!mat) continue;
         const block = html.slice(cs, bi + 1 < chanStarts.length ? chanStarts[bi + 1] : Math.min(html.length, cs + 6000));
         const chans = {};
@@ -96,9 +99,14 @@ async function getModelConfig(uid) {
             const sub = block.slice(ci, end);
             if (!/"enable"\s*:\s*true/.test(sub)) continue;
             const t = sub.match(/"texture"[\s\S]*?"uid"\s*:\s*"([a-f0-9]+)"/);
-            if (t) { const tex = bestTexture(t[1]); if (tex) chans[chName] = tex; }
+            if (t) { chans[chName] = { ...(bestTexture(t[1]) || {}), setUid: t[1] }; if (chName === 'AlbedoPBR') chans[chName].albedoUid = t[1]; }
         }
-        if (Object.keys(chans).length) materials[mat.name] = chans;
+        // keep only channels that resolved to a real texture file
+        for (const k of Object.keys(chans)) if (!chans[k].url) delete chans[k];
+        if (Object.keys(chans).length) {
+            materials[mat.name] = chans;
+            if (chans.AlbedoPBR && chans.AlbedoPBR.setUid) materialsByAlbedo[chans.AlbedoPBR.setUid] = chans;
+        }
     }
 
     // Backward-compatible single texture map (first material with an albedo).
@@ -108,7 +116,7 @@ async function getModelConfig(uid) {
         uid, baseUrl, html,
         diterB: pMatch[2],
         diterV: parseInt(pMatch[1]),
-        textureMap, materials
+        textureMap, materials, materialsByAlbedo
     };
 }
 
@@ -733,30 +741,56 @@ function convertToGltf(osgjs, polyBin, wireBin, textureFiles) {
         let tcIdx = 0;
         for (const k of tcKeys) { attrs[`TEXCOORD_${tcIdx++}`] = attrs[k]; delete attrs[k]; }
 
-        return { name: geom.Name || 'mesh', indices, attributes: attrs };
+        // Link to the material via the StateSet: material name and/or the texture
+        // set uid referenced by the geometry (how the viewer picks each material).
+        let matName = null, texSetUid = null;
+        const ss = geom.StateSet && (geom.StateSet['osg.StateSet'] || geom.StateSet);
+        if (ss) {
+            for (const attr of (ss.AttributeList || [])) if (attr['osg.Material'] && attr['osg.Material'].Name) matName = attr['osg.Material'].Name;
+            for (const unit of (ss.TextureAttributeList || [])) for (const ta of (unit || [])) {
+                const f = ta['osg.Texture'] && ta['osg.Texture'].File;
+                if (f) { const mm = f.match(/textures\/([^/]+)\//); if (mm) texSetUid = mm[1]; }
+            }
+        }
+        return { name: geom.Name || 'mesh', indices, attributes: attrs, matName, texSetUid };
     }
 
-    function traverse(obj) {
+    // Multiply two column-major 4x4 matrices (parent * child).
+    function mat4mul(a, b) {
+        const r = new Array(16);
+        for (let c = 0; c < 4; c++)
+            for (let row = 0; row < 4; row++)
+                r[c * 4 + row] = a[row] * b[c * 4] + a[4 + row] * b[c * 4 + 1] + a[8 + row] * b[c * 4 + 2] + a[12 + row] * b[c * 4 + 3];
+        return r;
+    }
+    const IDENTITY = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+
+    function traverse(obj, matrix) {
         if (!obj || typeof obj !== 'object') return;
+        const mt = obj['osg.MatrixTransform'];
+        if (mt && Array.isArray(mt.Matrix)) matrix = mat4mul(matrix, mt.Matrix);
         if (obj['osg.Geometry']) {
             const g = obj['osg.Geometry'];
-            if ((g.PrimitiveSetList || []).some(p => Object.values(p)[0] && Object.values(p)[0].Mode === 'LINES')) return;
-            if (g.UniqueID !== undefined) { if (seen.has(g.UniqueID)) return; seen.add(g.UniqueID); }
-            try { const r = processGeom(g); if (r && r.indices && r.attributes.POSITION) geometries.push(r); }
-            catch (e) { console.warn(`  Warning: ${g.Name}: ${e.message}`); }
+            if (!(g.PrimitiveSetList || []).some(p => Object.values(p)[0] && Object.values(p)[0].Mode === 'LINES')) {
+                if (g.UniqueID === undefined || !seen.has(g.UniqueID)) {
+                    if (g.UniqueID !== undefined) seen.add(g.UniqueID);
+                    try { const r = processGeom(g); if (r && r.indices && r.attributes.POSITION) { r.matrix = matrix; geometries.push(r); } }
+                    catch (e) { console.warn(`  Warning: ${g.Name}: ${e.message}`); }
+                }
+            }
         }
-        const ch = (obj['osg.Node'] && obj['osg.Node'].Children) || (obj['osg.MatrixTransform'] && obj['osg.MatrixTransform'].Children) || obj.Children;
-        if (ch) for (const c of ch) traverse(c);
+        const ch = (obj['osg.Node'] && obj['osg.Node'].Children) || (mt && mt.Children) || obj.Children;
+        if (ch) for (const c of ch) traverse(c, matrix);
     }
 
-    traverse(osgjs);
+    traverse(osgjs, IDENTITY);
     console.log(`  ${geometries.length} geometries found`);
 
     // Build GLB
     const gltf = {
         asset: { version: '2.0', generator: 'sketchfab-downloader' },
-        scene: 0, scenes: [{ nodes: [0] }], nodes: [{ mesh: 0, name: 'root' }],
-        meshes: [{ primitives: [] }], accessors: [], bufferViews: [], buffers: [],
+        scene: 0, scenes: [{ nodes: [] }], nodes: [],
+        meshes: [], accessors: [], bufferViews: [], buffers: [],
         materials: [], textures: [], images: [], samplers: [{ magFilter: 9729, minFilter: 9987, wrapS: 10497, wrapT: 10497 }]
     };
 
@@ -827,25 +861,37 @@ function convertToGltf(osgjs, polyBin, wireBin, textureFiles) {
         return gltf.materials.push(mat) - 1;
     }
 
-    // materialsClean maps material name → channels. Assign each geometry to the
-    // material whose name appears in the geometry name (e.g. "Asteroid_1_MAT").
+    // materialsClean maps material name → channels. Match each geometry to its
+    // material via the StateSet (texture-set uid, then material name), falling
+    // back to the material name appearing in the geometry name.
     const materialsClean = textureFiles || {};
     const matNames = Object.keys(materialsClean);
     const matIndex = {};
     for (const n of matNames) matIndex[n] = buildMaterial(n, materialsClean[n]);
     if (!matNames.length) matIndex['__default'] = buildMaterial('material', null);
 
-    function materialForGeom(geomName) {
-        for (const n of matNames) if (n && geomName && geomName.indexOf(n) !== -1) return matIndex[n];
+    const albedoToMat = {};
+    for (const [n, ch] of Object.entries(materialsClean)) if (ch.AlbedoPBR && ch.AlbedoPBR.setUid) albedoToMat[ch.AlbedoPBR.setUid] = n;
+
+    function materialForGeom(geom) {
+        if (geom.texSetUid && albedoToMat[geom.texSetUid] !== undefined) return matIndex[albedoToMat[geom.texSetUid]];
+        if (geom.matName && matIndex[geom.matName] !== undefined) return matIndex[geom.matName];
+        for (const n of matNames) if (n && geom.name && geom.name.indexOf(n) !== -1) return matIndex[n];
         return Object.values(matIndex)[0] || 0;
     }
 
+    // Each geometry becomes its own mesh + node so it can carry its own transform
+    // matrix; otherwise every part (wheels, doors, …) collapses onto the origin.
+    const isIdentity = (m) => !m || m.every((v, i) => v === [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1][i]);
     for (const geom of geometries) {
-        const prim = { attributes: {}, material: materialForGeom(geom.name) };
+        const prim = { attributes: {}, material: materialForGeom(geom) };
         prim.indices = addAccessor(geom.indices, geom.indices.BYTES_PER_ELEMENT === 4 ? 5125 : 5123, geom.indices.length, 1);
         for (const [name, attr] of Object.entries(geom.attributes))
             prim.attributes[name] = addAccessor(attr.data, attr.componentType || 5126, attr.count, attr.itemSize, attr.normalized);
-        gltf.meshes[0].primitives.push(prim);
+        const meshIdx = gltf.meshes.push({ primitives: [prim], name: geom.name }) - 1;
+        const node = { mesh: meshIdx, name: geom.name };
+        if (!isIdentity(geom.matrix)) node.matrix = geom.matrix;
+        gltf.scenes[0].nodes.push(gltf.nodes.push(node) - 1);
     }
 
     const binBuffer = Buffer.concat(binChunks);
