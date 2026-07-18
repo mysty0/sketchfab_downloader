@@ -14,7 +14,7 @@ const zlib = require('zlib');
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 const STATIC_KEY = "77d92dd656ac3fdde472d5ba59747f42ac0ce217";
-const WORK_DIR = path.join(__dirname, '.cache');
+let WORK_DIR = path.join(__dirname, '.cache');
 
 // ─── HTTP helpers ─────────────────────────────────────────────────────────────
 
@@ -46,21 +46,12 @@ async function getModelConfig(uid) {
 
     const baseUrl = binzMatch[0].replace(/\/file\.binz$/, '');
 
-    // Extract material channels with texture UIDs
-    let channels = {};
-    for (const chName of ['AlbedoPBR', 'EmitColor', 'NormalMap', 'MetalnessPBR', 'RoughnessPBR']) {
-        const re = new RegExp(`"${chName}"[\\s\\S]*?"texture"[\\s\\S]*?"uid"\\s*:\\s*"([a-f0-9]+)"`);
-        const m = html.match(re);
-        if (m) channels[chName] = m[1];
-    }
-
-    // Extract texture entries: uid → {url, pk, width}
-    // Each entry has nested objects, so use [\s\S] to cross } boundaries
+    // Extract the texture registry: texture-set uid → best (largest) image.
     const texEntries = {};
     const texPattern = /"uid":\s*"([^"]+)"[\s\S]*?"width":\s*(\d+)[\s\S]*?"url":\s*"([^"]+)"[\s\S]*?"pk":\s*(\d+)/g;
     let tm;
     while ((tm = texPattern.exec(html)) !== null) {
-        const [, uid2, w, url, pk] = tm;
+        const [, , w, url, pk] = tm;
         const setMatch = url.match(/\/textures\/([^/]+)\//);
         if (!setMatch) continue;
         const setUid = setMatch[1];
@@ -69,22 +60,55 @@ async function getModelConfig(uid) {
             texEntries[key] = { setUid, url, pk: parseInt(pk), width: parseInt(w), filename: url.split('/').pop() };
         }
     }
-
-    // Map channels to best (largest) texture files
-    const textureMap = {};
-    for (const [chName, setUid] of Object.entries(channels)) {
+    const bestTexture = (setUid) => {
         let best = null;
-        for (const e of Object.values(texEntries)) {
-            if (e.setUid === setUid && (!best || e.width > best.width)) best = e;
+        for (const e of Object.values(texEntries)) if (e.setUid === setUid && (!best || e.width > best.width)) best = e;
+        return best;
+    };
+
+    // Parse each material separately. A model can have several materials (e.g. an
+    // asteroid pack with one atlas per rock); applying one material's textures to
+    // every geometry makes the others' UVs land in the atlas's empty regions.
+    // Each material is "name": "..._MAT", "channels": {...}. Pair every channels
+    // block with the material name just before it, then read its enabled channels
+    // (bounding each channel to the next so a disabled one can't grab the next's
+    // texture).
+    const CHANNELS = ['AlbedoPBR', 'EmitColor', 'NormalMap', 'MetalnessPBR', 'RoughnessPBR'];
+    const materials = {};
+    const chanStarts = [...html.matchAll(/"channels"\s*:\s*\{/g)].map(m => m.index);
+    const matNames = [...html.matchAll(/"name"\s*:\s*"([^"]*_MAT[^"]*)"/g)].map(m => ({ name: m[1], idx: m.index }));
+    for (let bi = 0; bi < chanStarts.length; bi++) {
+        const cs = chanStarts[bi];
+        let mat = null;
+        for (const mnp of matNames) if (mnp.idx < cs && (!mat || mnp.idx > mat.idx)) mat = mnp;
+        if (!mat) continue;
+        const block = html.slice(cs, bi + 1 < chanStarts.length ? chanStarts[bi + 1] : Math.min(html.length, cs + 6000));
+        const chans = {};
+        for (const chName of CHANNELS) {
+            const ci = block.indexOf(`"${chName}"`);
+            if (ci < 0) continue;
+            let end = block.length;
+            for (const o of CHANNELS) {
+                if (o === chName) continue;
+                const oi = block.indexOf(`"${o}"`, ci + chName.length + 2);
+                if (oi > ci && oi < end) end = oi;
+            }
+            const sub = block.slice(ci, end);
+            if (!/"enable"\s*:\s*true/.test(sub)) continue;
+            const t = sub.match(/"texture"[\s\S]*?"uid"\s*:\s*"([a-f0-9]+)"/);
+            if (t) { const tex = bestTexture(t[1]); if (tex) chans[chName] = tex; }
         }
-        if (best) textureMap[chName] = best;
+        if (Object.keys(chans).length) materials[mat.name] = chans;
     }
+
+    // Backward-compatible single texture map (first material with an albedo).
+    const textureMap = Object.values(materials).find(m => m.AlbedoPBR) || Object.values(materials)[0] || {};
 
     return {
         uid, baseUrl, html,
         diterB: pMatch[2],
         diterV: parseInt(pMatch[1]),
-        textureMap
+        textureMap, materials
     };
 }
 
@@ -109,13 +133,18 @@ async function downloadFiles(config) {
         }
     }
 
-    // Download textures
-    for (const [ch, tex] of Object.entries(config.textureMap)) {
-        const dest = path.join(WORK_DIR, 'textures', tex.filename);
-        if (!fs.existsSync(dest)) {
-            const data = await fetch(tex.url);
-            fs.writeFileSync(dest, data);
-            console.log(`  ${ch} texture: ${data.length} bytes`);
+    // Download textures for every material (dedup by filename).
+    const seen = new Set();
+    for (const chans of Object.values(config.materials || { m: config.textureMap })) {
+        for (const [ch, tex] of Object.entries(chans)) {
+            if (seen.has(tex.filename)) continue;
+            seen.add(tex.filename);
+            const dest = path.join(WORK_DIR, 'textures', tex.filename);
+            if (!fs.existsSync(dest)) {
+                const data = await fetch(tex.url);
+                fs.writeFileSync(dest, data);
+                console.log(`  ${ch} texture: ${data.length} bytes`);
+            }
         }
     }
 }
@@ -302,18 +331,24 @@ async function decryptAll(config) {
 
 // ─── Step 4: Texture descrambling ─────────────────────────────────────────────
 
-function mod(i, u) { const y = Math.floor(i / u); return i - y * u; }
+// Exact port of Sketchfab's GPU descramble fragment shader. Uses integer
+// (truncating) arithmetic and the analytic inverse mapping, matching the shader
+// exactly. The previous float-based inverse-map approach misplaced blocks at
+// rounding boundaries, leaving comb artifacts at UV-island edges that rendered
+// as fill-colour patches on the model.
+function idiv(a, b) { return Math.trunc(a / b); }
+function imod(i, u) { return i - idiv(i, u) * u; }
 
 function triSum(y, t, f) {
     const x = Math.min(y, t), n = Math.max(y, t);
-    if (f < x) return f * (f + 1) / 2;
-    if (f < n) return x * (x + 1) / 2 + x * (f - x);
+    if (f < x) return idiv(f * (f + 1), 2);
+    if (f < n) return idiv(x * (x + 1), 2) + x * (f - x);
     const r = f - n;
-    return x * (x + 1) / 2 + x * (n - x) + (x - 1) * r - (r - 1) * r / 2;
+    return idiv(x * (x + 1), 2) + x * (n - x) + (x - 1) * r - idiv((r - 1) * r, 2);
 }
 
 function xyToZigzag(gw, gh, px, py) {
-    const r = Math.min(gw, gh), n = Math.max(gw, gh), v = px + py, h = mod(v, 2) === 0;
+    const r = Math.min(gw, gh), n = Math.max(gw, gh), v = px + py, h = imod(v, 2) === 0;
     if (v < r) return triSum(gw, gh, v) + (h ? v - py : py);
     if (v < n) {
         let s = gh - py - 1;
@@ -326,43 +361,45 @@ function xyToZigzag(gw, gh, px, py) {
 
 function zigzagToXy(gw, gh, idx) {
     const v = Math.min(gw, gh), r = Math.max(gw, gh);
-    const t1 = v * (v + 1) / 2, t2 = t1 + v * (r - v);
+    const t1 = idiv(v * (v + 1), 2), t2 = t1 + v * (r - v);
     if (idx < t1) {
-        const n = Math.floor((-1 + Math.sqrt(8 * idx + 1)) / 2);
+        const n = idiv(-1 + Math.trunc(1e-6 + Math.sqrt(8 * idx + 1)), 2);
         const h = idx - triSum(gw, gh, n);
-        return mod(n, 2) === 0 ? [h, n - h] : [n - h, h];
+        return imod(n, 2) === 0 ? [h, n - h] : [n - h, h];
     }
     if (idx < t2) {
-        const x2 = idx - t1, n = v + Math.floor(x2 / v), s = mod(x2, v), h = mod(n, 2) === 0;
+        const x2 = idx - t1, n = v + idiv(x2, v), s = imod(x2, v), h = imod(n, 2) === 0;
         const g = n - v + s + 1, e = v - s - 1, S = n - s, T = s;
         if (gw > gh) return h ? [g, e] : [S, T];
         return h ? [T, S] : [e, g];
     }
-    const n2 = v * (v - 1) / 2 - (idx - t2) - 1;
-    const s2 = Math.floor((-1 + Math.sqrt(8 * n2 + 1)) / 2);
+    const n2 = idiv(v * (v - 1), 2) - (idx - t2) - 1;
+    const s2 = idiv(-1 + Math.trunc(Math.sqrt(8 * n2 + 1)), 2);
     const n = r + v - s2 - 2;
     let h2 = idx - triSum(gw, gh, n);
     const e2 = v + r - n - 1;
-    if (mod(n, 2) === 0) h2 = e2 - h2 - 1;
+    if (imod(n, 2) === 0) h2 = e2 - h2 - 1;
     const S2 = n + h2 - gw + 1;
     return [n - S2, S2];
 }
 
-function pixelToBlockIdx(x, y, bw, bh) {
-    const bi = xyToZigzag(bw, bh, Math.floor(x / 8), Math.floor(y / 8));
-    const rot = mod(bi, 4);
-    let px = mod(x, 8), py = mod(y, 8);
+// pixel (x,y) → scrambled flat index
+function pixelToFlat(x, y, bw, bh) {
+    const bi = xyToZigzag(bw, bh, idiv(x, 8), idiv(y, 8));
+    const rot = imod(bi, 4);
+    let px = imod(x, 8), py = imod(y, 8);
     if (rot === 1) px = 7 - px;
     else if (rot === 2) { const t = px; px = py; py = t; }
     else if (rot === 3) { const t = px; px = 7 - py; py = t; }
     return bi * 64 + px + py * 8;
 }
 
-function blockIdxToPixel(idx, w, h) {
-    const bw = w / 8, bh = h / 8;
-    const bi = Math.floor(idx / 64), intra = idx - bi * 64;
-    const iy = Math.floor(intra / 8), ix = intra - iy * 8;
-    const rot = mod(bi, 4);
+// scrambled flat index → source pixel (x,y)
+function flatToPixel(idx, w, h) {
+    const bw = idiv(w, 8), bh = idiv(h, 8);
+    const bi = idiv(idx, 64), intra = idx - bi * 64;
+    const iy = idiv(intra, 8), ix = intra - iy * 8;
+    const rot = imod(bi, 4);
     const bp = zigzagToXy(bw, bh, bi);
     let px = bp[0] * 8, py = bp[1] * 8;
     if (rot === 0) { px += ix; py += iy; }
@@ -374,38 +411,16 @@ function blockIdxToPixel(idx, w, h) {
 
 function descrambleTexture(imgBuf, w, h, channels, pk) {
     const total = w * h;
-    const offset = ((-pk) * 64) % total + ((-pk * 64 % total < 0) ? total : 0);
-    const bw = w / 8, bh = h / 8;
-
-    // Build forward map: for each pixel position, compute its block index
-    const blockMap = new Int32Array(total);
-    for (let y = 0; y < h; y++) {
-        for (let x = 0; x < w; x++) {
-            blockMap[y * w + x] = pixelToBlockIdx(x, y, bw, bh);
-        }
-    }
-
-    // Build inverse map
-    const invX = new Int32Array(total);
-    const invY = new Int32Array(total);
-    for (let y = 0; y < h; y++) {
-        for (let x = 0; x < w; x++) {
-            const fi = blockMap[y * w + x];
-            invX[fi] = x;
-            invY[fi] = y;
-        }
-    }
-
-    // Apply permutation
+    const bw = idiv(w, 8), bh = idiv(h, 8);
+    const offset = -((pk * 64) % total); // shader: pk*=64; pk%=total; shader.prepare(-pk)
     const result = Buffer.alloc(imgBuf.length);
     for (let y = 0; y < h; y++) {
         for (let x = 0; x < w; x++) {
-            const fi = blockMap[y * w + x];
-            let shifted = (fi + offset) % total;
-            if (shifted < 0) shifted += total;
-            const sx = invX[shifted], sy = invY[shifted];
+            let n = pixelToFlat(x, y, bw, bh) + offset;
+            if (n < 0) n += total;
+            const src = flatToPixel(n, w, h);
             const dstOff = (y * w + x) * channels;
-            const srcOff = (sy * w + sx) * channels;
+            const srcOff = (src[1] * w + src[0]) * channels;
             for (let c = 0; c < channels; c++) result[dstOff + c] = imgBuf[srcOff + c];
         }
     }
@@ -419,9 +434,8 @@ async function descrambleTextures(config) {
     try {
         const sharp = require('sharp');
         decodeImage = async (p) => {
-            const meta = await sharp(p).metadata();
-            const raw = await sharp(p).removeAlpha().ensureAlpha(0).raw().toBuffer();
-            return { data: raw, width: meta.width, height: meta.height, channels: meta.channels || 3 };
+            const { data, info } = await sharp(p).raw().toBuffer({ resolveWithObject: true });
+            return { data, width: info.width, height: info.height, channels: info.channels };
         };
         encodeImage = async (buf, w, h, ch, outPath) => {
             await sharp(buf, { raw: { width: w, height: h, channels: ch } })
@@ -432,45 +446,72 @@ async function descrambleTextures(config) {
         // Fallback: use the scrambled textures as-is (user can descramble separately)
         console.log('  sharp not available — install with: npm install sharp');
         console.log('  Using scrambled textures (run descramble.py separately)');
-        return config.textureMap;
+        return config.materials && Object.keys(config.materials).length ? config.materials : { default: config.textureMap };
     }
 
-    // Build block maps once for the largest texture size
-    let cachedBlockMap = null, cachedW = 0, cachedH = 0;
-
-    const cleanMap = {};
-    for (const [chName, tex] of Object.entries(config.textureMap)) {
-        const srcPath = path.join(WORK_DIR, 'textures', tex.filename);
+    // Descramble every texture (dedup by filename), then build one clean map per
+    // material plus that material's combined metal/rough texture.
+    const descrambledCache = {};
+    async function descrambleOne(tex) {
+        if (descrambledCache[tex.filename]) return descrambledCache[tex.filename];
         const ext = tex.filename.endsWith('.png') ? '.png' : '.jpeg';
-        const cleanName = chName.toLowerCase() + '_clean' + ext;
+        const cleanName = tex.filename.replace(/\.[^.]+$/, '') + '_clean' + ext;
         const dstPath = path.join(WORK_DIR, 'textures', cleanName);
-
-        if (fs.existsSync(dstPath)) {
-            cleanMap[chName] = { ...tex, cleanFile: cleanName };
-            continue;
+        if (!fs.existsSync(dstPath)) {
+            const img = await decodeImage(path.join(WORK_DIR, 'textures', tex.filename));
+            console.log(`  ${tex.filename}: ${img.width}x${img.height} pk=${tex.pk}`);
+            const descrambled = descrambleTexture(img.data, img.width, img.height, img.channels, tex.pk);
+            await encodeImage(descrambled, img.width, img.height, img.channels, dstPath);
         }
-
-        const img = await decodeImage(srcPath);
-        console.log(`  ${chName}: ${img.width}x${img.height} pk=${tex.pk}`);
-        const descrambled = descrambleTexture(img.data, img.width, img.height, img.channels, tex.pk);
-        await encodeImage(descrambled, img.width, img.height, img.channels, dstPath);
-        cleanMap[chName] = { ...tex, cleanFile: cleanName };
-        console.log(`    → ${cleanName}`);
+        descrambledCache[tex.filename] = cleanName;
+        return cleanName;
     }
-    return cleanMap;
+
+    const mats = (config.materials && Object.keys(config.materials).length) ? config.materials : { default: config.textureMap };
+    const materialsClean = {};
+    for (const [matName, chans] of Object.entries(mats)) {
+        const cleanMap = {};
+        for (const [chName, tex] of Object.entries(chans)) {
+            cleanMap[chName] = { ...tex, cleanFile: await descrambleOne(tex) };
+        }
+        // glTF packs roughness in the G channel and metalness in the B channel of
+        // one texture; Sketchfab ships them separately, so combine per material.
+        if (cleanMap.MetalnessPBR && cleanMap.RoughnessPBR) {
+            const combName = cleanMap.MetalnessPBR.cleanFile.replace(/_clean.*/, '') + '_metalrough.png';
+            const combPath = path.join(WORK_DIR, 'textures', combName);
+            if (!fs.existsSync(combPath)) {
+                const mImg = await decodeImage(path.join(WORK_DIR, 'textures', cleanMap.MetalnessPBR.cleanFile));
+                const rImg = await decodeImage(path.join(WORK_DIR, 'textures', cleanMap.RoughnessPBR.cleanFile));
+                const w = mImg.width, h = mImg.height, mc = mImg.channels, rc = rImg.channels;
+                const out = Buffer.alloc(w * h * 3);
+                for (let i = 0; i < w * h; i++) { out[i * 3] = 255; out[i * 3 + 1] = rImg.data[i * rc]; out[i * 3 + 2] = mImg.data[i * mc]; }
+                await encodeImage(out, w, h, 3, combPath);
+            }
+            cleanMap.MetalRough = { cleanFile: combName };
+        }
+        materialsClean[matName] = cleanMap;
+        console.log(`  ${matName}: ${Object.keys(cleanMap).filter(k => k !== 'MetalRough').join(', ')}`);
+    }
+    return materialsClean;
 }
 
 // ─── Step 5: osgjs → glTF conversion ─────────────────────────────────────────
 
-function decodeVarint(bytes, count, signed) {
-    const result = signed ? new Int32Array(count) : new Uint32Array(count);
+function decodeVarint(bytes, count, typeName) {
+    // Allocate the buffer's native type (Uint16Array, Uint32Array, …). The width
+    // matters: parallelogram prediction relies on the integer arithmetic wrapping
+    // at the native width, exactly as the viewer decoder does. Using a wider type
+    // (e.g. Uint32 for a 16-bit UV buffer) breaks the wrap and corrupts UVs.
+    const types = { Float32Array, Int32Array, Uint32Array, Uint16Array, Uint8Array, Int16Array, Int8Array };
+    const Ctor = types[typeName] || Uint32Array;
+    const result = new Ctor(count);
     let a = 0, o = 0;
     while (a < count) {
         let s = 0, l = 0;
         do { s |= (bytes[o] & 127) << l; l += 7; } while ((bytes[o++] & 128) !== 0);
         result[a++] = s;
     }
-    if (signed) for (let u = 0; u < count; u++) { const c = result[u]; result[u] = (c >> 1) ^ -(c & 1); }
+    if (typeName[0] !== 'U') for (let u = 0; u < count; u++) { const c = result[u]; result[u] = (c >> 1) ^ -(c & 1); }
     return result;
 }
 
@@ -567,7 +608,7 @@ function looseToTris(indices) {
 
 function readBuf(bin, vb, itemSize, typeName) {
     const off = vb.Offset || 0, size = vb.Size;
-    if (vb.Encoding === 'varint') return decodeVarint(new Uint8Array(bin, off), size * itemSize, typeName[0] !== 'U');
+    if (vb.Encoding === 'varint') return decodeVarint(new Uint8Array(bin, off), size * itemSize, typeName);
     const types = { Float32Array, Int32Array, Uint32Array, Uint16Array, Uint8Array, Int16Array };
     return new types[typeName](bin, off, size * itemSize);
 }
@@ -761,23 +802,46 @@ function convertToGltf(osgjs, polyBin, wireBin, textureFiles) {
         return texIdx;
     }
 
-    // Material
-    const mat = { name: 'material', pbrMetallicRoughness: { baseColorFactor: [1, 1, 1, 1], metallicFactor: 1, roughnessFactor: 1 } };
+    // Build one glTF material per source material (each asteroid has its own atlas).
     const texDir = path.join(WORK_DIR, 'textures');
-    if (textureFiles) {
-        const albedo = textureFiles.AlbedoPBR;
-        if (albedo) { const idx = addTexture(path.join(texDir, albedo.cleanFile || albedo.filename)); if (idx >= 0) mat.pbrMetallicRoughness.baseColorTexture = { index: idx }; }
-        const metal = textureFiles.MetalnessPBR;
-        if (metal) { const idx = addTexture(path.join(texDir, metal.cleanFile || metal.filename)); if (idx >= 0) mat.pbrMetallicRoughness.metallicRoughnessTexture = { index: idx }; }
-        const norm = textureFiles.NormalMap;
-        if (norm) { const idx = addTexture(path.join(texDir, norm.cleanFile || norm.filename)); if (idx >= 0) mat.normalTexture = { index: idx, scale: 1 }; }
-        const emit = textureFiles.EmitColor;
-        if (emit) { const idx = addTexture(path.join(texDir, emit.cleanFile || emit.filename)); if (idx >= 0) { mat.emissiveTexture = { index: idx }; mat.emissiveFactor = [1, 1, 1]; } }
+    const texCache = {};
+    function addTextureCached(file) {
+        if (texCache[file] !== undefined) return texCache[file];
+        const idx = addTexture(path.join(texDir, file));
+        texCache[file] = idx;
+        return idx;
     }
-    gltf.materials.push(mat);
+    function buildMaterial(name, chans) {
+        const mat = { name, pbrMetallicRoughness: { baseColorFactor: [1, 1, 1, 1], metallicFactor: 1, roughnessFactor: 1 } };
+        if (chans) {
+            const albedo = chans.AlbedoPBR;
+            if (albedo) { const i = addTextureCached(albedo.cleanFile || albedo.filename); if (i >= 0) mat.pbrMetallicRoughness.baseColorTexture = { index: i }; }
+            const mr = chans.MetalRough;
+            if (mr) { const i = addTextureCached(mr.cleanFile); if (i >= 0) mat.pbrMetallicRoughness.metallicRoughnessTexture = { index: i }; }
+            else if (chans.MetalnessPBR) { const i = addTextureCached(chans.MetalnessPBR.cleanFile || chans.MetalnessPBR.filename); if (i >= 0) mat.pbrMetallicRoughness.metallicRoughnessTexture = { index: i }; }
+            const norm = chans.NormalMap;
+            if (norm) { const i = addTextureCached(norm.cleanFile || norm.filename); if (i >= 0) mat.normalTexture = { index: i, scale: 1 }; }
+            const emit = chans.EmitColor;
+            if (emit) { const i = addTextureCached(emit.cleanFile || emit.filename); if (i >= 0) { mat.emissiveTexture = { index: i }; mat.emissiveFactor = [1, 1, 1]; } }
+        }
+        return gltf.materials.push(mat) - 1;
+    }
+
+    // materialsClean maps material name → channels. Assign each geometry to the
+    // material whose name appears in the geometry name (e.g. "Asteroid_1_MAT").
+    const materialsClean = textureFiles || {};
+    const matNames = Object.keys(materialsClean);
+    const matIndex = {};
+    for (const n of matNames) matIndex[n] = buildMaterial(n, materialsClean[n]);
+    if (!matNames.length) matIndex['__default'] = buildMaterial('material', null);
+
+    function materialForGeom(geomName) {
+        for (const n of matNames) if (n && geomName && geomName.indexOf(n) !== -1) return matIndex[n];
+        return Object.values(matIndex)[0] || 0;
+    }
 
     for (const geom of geometries) {
-        const prim = { attributes: {}, material: 0 };
+        const prim = { attributes: {}, material: materialForGeom(geom.name) };
         prim.indices = addAccessor(geom.indices, geom.indices.BYTES_PER_ELEMENT === 4 ? 5125 : 5123, geom.indices.length, 1);
         for (const [name, attr] of Object.entries(geom.attributes))
             prim.attributes[name] = addAccessor(attr.data, attr.componentType || 5126, attr.count, attr.itemSize, attr.normalized);
@@ -815,6 +879,7 @@ async function main() {
     const uidMatch = arg.match(/([a-f0-9]{32})/);
     if (!uidMatch) { console.error('Could not extract model UID from:', arg); process.exit(1); }
     const uid = uidMatch[1];
+    WORK_DIR = path.join(__dirname, '.cache', uid);
     const outputPath = process.argv[3] || `${uid}.glb`;
 
     console.log(`Sketchfab Downloader — Model: ${uid}\n`);

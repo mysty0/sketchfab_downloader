@@ -141,7 +141,7 @@ def descramble_texture(img_array, pk):
     h, w = img_array.shape[:2]
     channels = img_array.shape[2] if len(img_array.shape) > 2 else 1
     total = w * h
-    offset = (pk * 64) % total
+    offset = (-pk * 64) % total
 
     result = np.zeros_like(img_array)
 
@@ -164,7 +164,7 @@ def descramble_fast(img_array, pk):
     """Vectorized descramble using precomputed lookup table."""
     h, w = img_array.shape[:2]
     total = w * h
-    offset = (pk * 64) % total
+    offset = (-pk * 64) % total
 
     # Build lookup: for each output pixel (x,y), find source pixel
     # This is the inverse of the scramble
