@@ -1,7 +1,10 @@
 const fs = require('fs');
 const path = require('path');
 
-const STATIC_KEY = "77d92dd656ac3fdde472d5ba59747f42ac0ce217";
+// Last observed value (2026-10-20); Sketchfab rotates it periodically.
+// download.js extracts the live key from the viewer bundles; this standalone
+// script only has the hardcoded one.
+const STATIC_KEY = "2cf4a19c7d4d861087fc573a30581f5f4b33b6e4";
 
 function parseWasmDataSize(wasmBytes) {
     let m = 65536;

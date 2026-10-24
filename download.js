@@ -13,7 +13,9 @@ const zlib = require('zlib');
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const STATIC_KEY = "77d92dd656ac3fdde472d5ba59747f42ac0ce217";
+// Fallback only: the live key is pulled from the viewer bundles on every run.
+// Last observed value (2026-10-20); Sketchfab rotates it periodically.
+const STATIC_KEY = "2cf4a19c7d4d861087fc573a30581f5f4b33b6e4";
 let WORK_DIR = path.join(__dirname, '.cache');
 
 // ─── HTTP helpers ─────────────────────────────────────────────────────────────
@@ -207,15 +209,31 @@ async function extractStaticKey(embedHtml) {
         (embedHtml.match(/https:\/\/static\.sketchfab\.com\/static\/builds\/web\/dist\/[^"&]+\.js/g) || [])
     )];
 
+    // The key has moved between bundle shapes over time. Try each known shape,
+    // most specific first. Older builds inlined it next to the `k` export:
+    //   i.d(e,{k:()=>r});const r="<40 hex>\n"
+    // Newer builds re-export it from a standalone CommonJS module:
+    //   C04p:t=>{"use strict";t.exports="<40 hex>\n"}
+    const KEY_PATTERNS = [
+        /exports\s*\.\s*k\s*:\s*\(\)\s*=>\s*\w+\}\s*;\s*const\s+\w+\s*=\s*"([0-9a-f]{40})\\n"/,
+        /\{k:\s*\(\)\s*=>\s*\w+\}[^;]*;\s*const\s+\w+\s*=\s*"([0-9a-f]{40})/,
+        /\.exports\s*=\s*"([0-9a-f]{40})\\n"/,
+        /"([0-9a-f]{40})\\n"/,
+    ];
+
     for (const url of bundleUrls) {
         const js = (await fetch(url)).toString('utf8');
-        const match = js.match(/exports\s*\.\s*k\s*:\s*\(\)\s*=>\s*\w+\}\s*;\s*const\s+\w+\s*=\s*"([0-9a-f]{40})\\n"/);
-        if (match) return match[1];
-        const match2 = js.match(/\{k:\s*\(\)\s*=>\s*\w+\}[^;]*;\s*const\s+\w+\s*=\s*"([0-9a-f]{40})/);
-        if (match2) return match2[1];
+        for (const re of KEY_PATTERNS) {
+            const match = js.match(re);
+            if (match) {
+                console.log(`  Static key: ${match[1]} (from ${url.split('/').pop()})`);
+                return match[1];
+            }
+        }
     }
 
-    return STATIC_KEY; // fallback to hardcoded
+    console.warn(`  Static key not found in viewer bundles, falling back to hardcoded ${STATIC_KEY}`);
+    return STATIC_KEY;
 }
 
 // ─── Step 3: WASM decryption ──────────────────────────────────────────────────
@@ -765,21 +783,34 @@ function convertToGltf(osgjs, polyBin, wireBin, textureFiles) {
     }
     const IDENTITY = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
 
+    function addGeom(g, matrix) {
+        if ((g.PrimitiveSetList || []).some(p => Object.values(p)[0] && Object.values(p)[0].Mode === 'LINES')) return;
+        if (g.UniqueID !== undefined) {
+            if (seen.has(g.UniqueID)) return;
+            seen.add(g.UniqueID);
+        }
+        try { const r = processGeom(g); if (r && r.indices && r.attributes.POSITION) { r.matrix = matrix; geometries.push(r); } }
+        catch (e) { console.warn(`  Warning: ${g.Name}: ${e.message}`); }
+    }
+
+    // Every osgjs node is wrapped in one typed key ("osg.Node",
+    // "osg.MatrixTransform", "osgAnimation.Skeleton", "osgAnimation.Bone", ...)
+    // and any of them may carry a Matrix and Children. Find the wrapper by shape
+    // rather than by name: rigged models hang their meshes under a Skeleton, and
+    // matching only osg.Node / osg.MatrixTransform skipped them entirely
+    // ("0 geometries found").
     function traverse(obj, matrix) {
         if (!obj || typeof obj !== 'object') return;
-        const mt = obj['osg.MatrixTransform'];
-        if (mt && Array.isArray(mt.Matrix)) matrix = mat4mul(matrix, mt.Matrix);
-        if (obj['osg.Geometry']) {
-            const g = obj['osg.Geometry'];
-            if (!(g.PrimitiveSetList || []).some(p => Object.values(p)[0] && Object.values(p)[0].Mode === 'LINES')) {
-                if (g.UniqueID === undefined || !seen.has(g.UniqueID)) {
-                    if (g.UniqueID !== undefined) seen.add(g.UniqueID);
-                    try { const r = processGeom(g); if (r && r.indices && r.attributes.POSITION) { r.matrix = matrix; geometries.push(r); } }
-                    catch (e) { console.warn(`  Warning: ${g.Name}: ${e.message}`); }
-                }
-            }
-        }
-        const ch = (obj['osg.Node'] && obj['osg.Node'].Children) || (mt && mt.Children) || obj.Children;
+        const node = Object.values(obj).find(v => v && typeof v === 'object' && !Array.isArray(v)
+            && (Array.isArray(v.Children) || Array.isArray(v.Matrix)));
+        if (node && Array.isArray(node.Matrix)) matrix = mat4mul(matrix, node.Matrix);
+        if (obj['osg.Geometry']) addGeom(obj['osg.Geometry'], matrix);
+        // Skinned meshes are wrapped in a RigGeometry whose SourceGeometry holds
+        // the bind-pose mesh (the rig itself only adds Bones/Weights). Export the
+        // bind pose; skinning and animation are not carried over.
+        const rig = obj['osgAnimation.RigGeometry'];
+        if (rig && rig.SourceGeometry && rig.SourceGeometry['osg.Geometry']) addGeom(rig.SourceGeometry['osg.Geometry'], matrix);
+        const ch = (node && node.Children) || obj.Children;
         if (ch) for (const c of ch) traverse(c, matrix);
     }
 
@@ -873,11 +904,23 @@ function convertToGltf(osgjs, polyBin, wireBin, textureFiles) {
     const albedoToMat = {};
     for (const [n, ch] of Object.entries(materialsClean)) if (ch.AlbedoPBR && ch.AlbedoPBR.setUid) albedoToMat[ch.AlbedoPBR.setUid] = n;
 
-    function materialForGeom(geom) {
+    function resolveMaterial(geom) {
         if (geom.texSetUid && albedoToMat[geom.texSetUid] !== undefined) return matIndex[albedoToMat[geom.texSetUid]];
         if (geom.matName && matIndex[geom.matName] !== undefined) return matIndex[geom.matName];
         for (const n of matNames) if (n && geom.name && geom.name.indexOf(n) !== -1) return matIndex[n];
         return Object.values(matIndex)[0] || 0;
+    }
+    const usesTextures = (m) => !!(m.pbrMetallicRoughness.baseColorTexture || m.pbrMetallicRoughness.metallicRoughnessTexture || m.normalTexture || m.emissiveTexture);
+
+    // A geometry without UVs (e.g. a ground plane in a rigged scene) cannot use
+    // a textured material: the texture bindings would reference a TEXCOORD_0 it
+    // does not have, which is invalid glTF. Give it a plain material instead.
+    let untexturedIdx = -1;
+    function materialForGeom(geom) {
+        const idx = resolveMaterial(geom);
+        if (geom.attributes.TEXCOORD_0 || !usesTextures(gltf.materials[idx])) return idx;
+        if (untexturedIdx < 0) untexturedIdx = buildMaterial('material', null);
+        return untexturedIdx;
     }
 
     // Each geometry becomes its own mesh + node so it can carry its own transform
