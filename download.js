@@ -13,7 +13,7 @@ const zlib = require('zlib');
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const STATIC_KEY = "77d92dd656ac3fdde472d5ba59747f42ac0ce217";
+const STATIC_KEY = "64b1a4c1614af2eb27b666dd6053a8a4769dbbd1";
 let WORK_DIR = path.join(__dirname, '.cache');
 
 // ─── HTTP helpers ─────────────────────────────────────────────────────────────
@@ -207,12 +207,32 @@ async function extractStaticKey(embedHtml) {
         (embedHtml.match(/https:\/\/static\.sketchfab\.com\/static\/builds\/web\/dist\/[^"&]+\.js/g) || [])
     )];
 
+    const bundles = [];
+    let keyModuleId = null;
+
     for (const url of bundleUrls) {
         const js = (await fetch(url)).toString('utf8');
+        bundles.push(js);
+
         const match = js.match(/exports\s*\.\s*k\s*:\s*\(\)\s*=>\s*\w+\}\s*;\s*const\s+\w+\s*=\s*"([0-9a-f]{40})\\n"/);
         if (match) return match[1];
         const match2 = js.match(/\{k:\s*\(\)\s*=>\s*\w+\}[^;]*;\s*const\s+\w+\s*=\s*"([0-9a-f]{40})/);
         if (match2) return match2[1];
+
+        // Current Sketchfab webpack layout: {k:()=>r});const r=i("C04p")
+        if (!keyModuleId) {
+            const modMatch = js.match(/\{k:\s*\(\)\s*=>\s*\w+\}\s*\)\s*;\s*const\s+\w+\s*=\s*\w+\(\s*"([^"]+)"\s*\)/);
+            if (modMatch) keyModuleId = modMatch[1];
+        }
+    }
+
+    if (keyModuleId) {
+        const escapedId = keyModuleId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const modRegex = new RegExp(`(?:^|[,{\\s])"?${escapedId}"?\\s*:\\s*\\w+\\s*=>\\s*\\{[^}]*\\.exports\\s*=\\s*"([0-9a-f]{40})(?:\\\\n)?"`);
+        for (const js of bundles) {
+            const m = js.match(modRegex);
+            if (m) return m[1];
+        }
     }
 
     return STATIC_KEY; // fallback to hardcoded
